@@ -287,7 +287,7 @@ async def run_check():
     total_new = 0
     for query in watches:
         try:
-            results = await asyncio.to_thread(vinted.search_all, query)
+            results = await asyncio.to_thread(vinted.search_all, query, 2)
         except Exception:
             logger.exception(f"Monitor error for '{query}'")
             continue

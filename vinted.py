@@ -58,11 +58,11 @@ class VintedClient:
                     continue
                 return []
 
-    def search(self, domain: str, query: str, per_page: int = 96) -> list[dict]:
-        """Search all pages of items on a specific Vinted domain."""
+    def search(self, domain: str, query: str, per_page: int = 96, max_pages: int = 10) -> list[dict]:
+        """Search items on a specific Vinted domain with pagination."""
         all_items = []
         page = 1
-        while True:
+        while page <= max_pages:
             items = self._fetch_page(domain, query, page, per_page)
             if not items:
                 break
@@ -73,6 +73,6 @@ class VintedClient:
         logger.info(f"[{domain}] '{query}': {len(all_items)} items across {page} pages")
         return all_items
 
-    def search_all(self, query: str) -> dict[str, list[dict]]:
+    def search_all(self, query: str, max_pages: int = 10) -> dict[str, list[dict]]:
         """Search across all Vinted domains."""
-        return {domain: self.search(domain, query) for domain in DOMAINS}
+        return {domain: self.search(domain, query, max_pages=max_pages) for domain in DOMAINS}
