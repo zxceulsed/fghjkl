@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import time
@@ -23,9 +25,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────
-BOT_TOKEN = "6374810081:AAG2YazUJqWkPJp8vZw4cwfirodwAj2W6WY"
-CHAT_ID = "823388511"  # default notification chat id; can be changed via bot
-CHECK_INTERVAL = 240  # seconds (5 min)
+BOT_TOKEN = "8791687514:AAHJ1zceedGvmfqY6f9FK_b-S54E5R9nBCM"
+CHAT_ID = "1087422106"  # default notification chat id; can be changed via bot
+ADMIN_ID = 1087422106   # admin user id (can manage whitelist)
+CHECK_INTERVAL = 240   # seconds (5 min)
 # ────────────────────────────────────────────────────────────────────
 
 db = Database()
@@ -37,6 +40,8 @@ router = Router()
 class Form(StatesGroup):
     waiting_url = State()
     waiting_chat_id = State()
+    waiting_add_user = State()
+    waiting_remove_user = State()
 
 
 KB = ReplyKeyboardMarkup(
@@ -48,8 +53,27 @@ KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+KB_ADMIN = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Добавить ссылку"), KeyboardButton(text="Удалить ссылку")],
+        [KeyboardButton(text="Все ссылки"), KeyboardButton(text="Статус")],
+        [KeyboardButton(text="Изменить Chat ID"), KeyboardButton(text="Показать Chat ID")],
+        [KeyboardButton(text="Добавить пользователя"), KeyboardButton(text="Удалить пользователя")],
+        [KeyboardButton(text="Список пользователей")],
+    ],
+    resize_keyboard=True,
+)
+
+
+def _get_kb(user_id: int) -> ReplyKeyboardMarkup:
+    return KB_ADMIN if user_id == ADMIN_ID else KB
+
+
+def _is_authorized(user_id: int) -> bool:
+    return user_id == ADMIN_ID or db.is_allowed(user_id)
+
 _last_check: float | None = None
-_force_check = asyncio.Event()
+_force_check: asyncio.Event | None = None
 
 
 def _extract_query(url: str) -> str | None:
@@ -83,16 +107,38 @@ def _split_message(header: str, blocks: list[str], sep: str = "\n\n") -> list[st
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    uid = message.from_user.id
+    if not _is_authorized(uid):
+        await message.answer(
+            "У вас нет доступа к этому боту.\n"
+            "Напишите администратору: @wazzamp"
+        )
+        return
     cid = str(message.chat.id)
     if not db.get_chat_id():
         db.set_chat_id(CHAT_ID or cid)
-    await message.answer("Vinted Monitor Bot", reply_markup=KB)
+    await message.answer("Vinted Monitor Bot", reply_markup=_get_kb(uid))
+
+
+# --- access check middleware ---
+
+async def _check_access(message: Message) -> bool:
+    uid = message.from_user.id
+    if not _is_authorized(uid):
+        await message.answer(
+            "У вас нет доступа к этому боту.\n"
+            "Напишите администратору: @wazzamp"
+        )
+        return False
+    return True
 
 
 # --- add ---
 
 @router.message(F.text == "Добавить ссылку")
 async def btn_add(message: Message, state: FSMContext):
+    if not await _check_access(message):
+        return
     await state.set_state(Form.waiting_url)
     await message.answer(
         "Отправьте ссылку на поиск Vinted:",
@@ -106,24 +152,25 @@ async def btn_add(message: Message, state: FSMContext):
 @router.message(Form.waiting_url, F.text == "Отмена")
 async def cancel_add(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Отменено.", reply_markup=KB)
+    await message.answer("Отменено.", reply_markup=_get_kb(message.from_user.id))
 
 
 @router.message(Form.waiting_url)
 async def recv_url(message: Message, state: FSMContext):
+    kb = _get_kb(message.from_user.id)
     query = _extract_query(message.text.strip())
     if not query:
         await state.clear()
         await message.answer(
             "Не удалось извлечь запрос. Нужна ссылка вида:\n"
             "https://www.vinted.pl/catalog?search_text=...",
-            reply_markup=KB,
+            reply_markup=kb,
         )
         return
 
     if not db.add_watch(query):
         await state.clear()
-        await message.answer(f'"{query}" уже отслеживается.', reply_markup=KB)
+        await message.answer(f'"{query}" уже отслеживается.', reply_markup=kb)
         return
 
     await message.answer(f'Добавлено: "{query}"\nПервичный парсинг...')
@@ -131,7 +178,7 @@ async def recv_url(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"Сохранено {count} товаров. Новые будут приходить в уведомлениях.",
-        reply_markup=KB,
+        reply_markup=kb,
     )
 
 
@@ -152,10 +199,12 @@ def _initial_parse(query: str) -> int:
 
 @router.message(F.text == "Удалить ссылку")
 async def btn_remove(message: Message, state: FSMContext):
+    if not await _check_access(message):
+        return
     await state.clear()
     watches = db.get_watches()
     if not watches:
-        await message.answer("Нет отслеживаемых запросов.", reply_markup=KB)
+        await message.answer("Нет отслеживаемых запросов.", reply_markup=_get_kb(message.from_user.id))
         return
 
     keyboard = [
@@ -183,10 +232,13 @@ async def cb_remove(callback: CallbackQuery):
 
 @router.message(F.text == "Все ссылки")
 async def btn_list(message: Message, state: FSMContext):
+    if not await _check_access(message):
+        return
     await state.clear()
+    kb = _get_kb(message.from_user.id)
     watches = db.get_watches()
     if not watches:
-        await message.answer("Нет отслеживаемых запросов.", reply_markup=KB)
+        await message.answer("Нет отслеживаемых запросов.", reply_markup=kb)
         return
 
     lines = []
@@ -199,13 +251,15 @@ async def btn_list(message: Message, state: FSMContext):
     header = "Отслеживаемые запросы:\n\n"
     chunks = _split_message(header, lines, sep="\n\n")
     for chunk in chunks:
-        await message.answer(chunk, reply_markup=KB, disable_web_page_preview=True)
+        await message.answer(chunk, reply_markup=kb, disable_web_page_preview=True)
 
 
 # --- chat id ---
 
 @router.message(F.text == "Изменить Chat ID")
 async def btn_change_cid(message: Message, state: FSMContext):
+    if not await _check_access(message):
+        return
     await state.set_state(Form.waiting_chat_id)
     await message.answer(
         "Отправьте новый Chat ID:",
@@ -219,7 +273,7 @@ async def btn_change_cid(message: Message, state: FSMContext):
 @router.message(Form.waiting_chat_id, F.text == "Отмена")
 async def cancel_chat_id(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Отменено.", reply_markup=KB)
+    await message.answer("Отменено.", reply_markup=_get_kb(message.from_user.id))
 
 
 @router.message(Form.waiting_chat_id)
@@ -231,18 +285,22 @@ async def recv_chat_id(message: Message, state: FSMContext):
         return
     db.set_chat_id(cid)
     await state.clear()
-    await message.answer(f"Chat ID: {cid}", reply_markup=KB)
+    await message.answer(f"Chat ID: {cid}", reply_markup=_get_kb(message.from_user.id))
 
 
 @router.message(F.text == "Показать Chat ID")
 async def btn_show_cid(message: Message, state: FSMContext):
+    if not await _check_access(message):
+        return
     await state.clear()
     cid = db.get_chat_id()
-    await message.answer(f"Chat ID: {cid or 'не задан'}", reply_markup=KB)
+    await message.answer(f"Chat ID: {cid or 'не задан'}", reply_markup=_get_kb(message.from_user.id))
 
 
 @router.message(F.text == "Статус")
 async def btn_status(message: Message, state: FSMContext):
+    if not await _check_access(message):
+        return
     await state.clear()
     global _last_check
     if _last_check is None:
@@ -255,7 +313,7 @@ async def btn_status(message: Message, state: FSMContext):
     await message.answer(
         f"Отслеживается запросов: {watches}\n"
         f"Следующая проверка через: {mins}м {secs}с",
-        reply_markup=KB,
+        reply_markup=_get_kb(message.from_user.id),
     )
     await message.answer(
         "Запустить проверку вручную?",
@@ -270,6 +328,96 @@ async def cb_force_check(callback: CallbackQuery):
     await callback.answer("Проверка запущена...")
     await callback.message.edit_text("Проверка запущена...")
     _force_check.set()
+
+
+# --- admin: user management ---
+
+def _is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+@router.message(F.text == "Добавить пользователя")
+async def btn_add_user(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        return
+    await state.set_state(Form.waiting_add_user)
+    await message.answer(
+        "Отправьте User ID пользователя:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(Form.waiting_add_user, F.text == "Отмена")
+async def cancel_add_user(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=KB_ADMIN)
+
+
+@router.message(Form.waiting_add_user)
+async def recv_add_user(message: Message, state: FSMContext):
+    import re
+    uid_str = message.text.strip()
+    if not re.fullmatch(r"\d+", uid_str):
+        await message.answer("User ID должен содержать только цифры. Попробуйте снова:")
+        return
+    uid = int(uid_str)
+    if db.add_allowed_user(uid):
+        await state.clear()
+        await message.answer(f"Пользователь {uid} добавлен в белый список.", reply_markup=KB_ADMIN)
+    else:
+        await state.clear()
+        await message.answer(f"Пользователь {uid} уже в белом списке.", reply_markup=KB_ADMIN)
+
+
+@router.message(F.text == "Удалить пользователя")
+async def btn_remove_user(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        return
+    await state.clear()
+    users = db.get_allowed_users()
+    if not users:
+        await message.answer("Белый список пуст.", reply_markup=KB_ADMIN)
+        return
+    keyboard = [
+        [InlineKeyboardButton(text=str(uid), callback_data=f"rmu:{uid}")]
+        for uid in users
+    ]
+    await message.answer(
+        "Выберите пользователя для удаления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+@router.callback_query(F.data.startswith("rmu:"))
+async def cb_remove_user(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.")
+        return
+    uid = int(callback.data[4:])
+    if db.remove_allowed_user(uid):
+        await callback.message.edit_text(f"Пользователь {uid} удалён из белого списка.")
+    else:
+        await callback.message.edit_text("Не найдено.")
+    await callback.answer()
+
+
+@router.message(F.text == "Список пользователей")
+async def btn_list_users(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        return
+    await state.clear()
+    users = db.get_allowed_users()
+    if not users:
+        await message.answer("Белый список пуст.", reply_markup=KB_ADMIN)
+        return
+    lines = [str(uid) for uid in users]
+    await message.answer(
+        "Белый список:\n" + "\n".join(lines),
+        reply_markup=KB_ADMIN,
+    )
 
 
 # ── Monitoring ──────────────────────────────────────────────────────
@@ -302,10 +450,14 @@ async def run_check():
 
                 new_ids.append(iid)
                 price = item.get("price", {})
+                size = item.get("size_title") or "—"
+                status = item.get("status") or "—"
                 text = (
                     f"{flag} <b>Новый товар</b>\n\n"
                     f"<b>{item.get('title', '—')}</b>\n"
                     f"Бренд: {item.get('brand_title', '—')}\n"
+                    f"Размер: {size}\n"
+                    f"Состояние: {status}\n"
                     f"Цена: {price.get('amount', '?')} {price.get('currency_code', '')}"
                 )
                 kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -357,6 +509,9 @@ async def monitor_loop():
 # ── Main ────────────────────────────────────────────────────────────
 
 async def main():
+    global _force_check
+    _force_check = asyncio.Event()
+
     dp = Dispatcher()
     dp.include_router(router)
 

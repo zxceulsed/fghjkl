@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sqlite3
 
 
@@ -22,6 +24,9 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY
                 );
             """)
 
@@ -63,3 +68,25 @@ class Database:
     def set_chat_id(self, chat_id: str):
         with self._conn() as c:
             c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('chat_id', ?)", (chat_id,))
+
+    # --- allowed users (whitelist) ---
+
+    def add_allowed_user(self, user_id: int) -> bool:
+        try:
+            with self._conn() as c:
+                c.execute("INSERT INTO allowed_users (user_id) VALUES (?)", (user_id,))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_allowed_user(self, user_id: int) -> bool:
+        with self._conn() as c:
+            return c.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,)).rowcount > 0
+
+    def is_allowed(self, user_id: int) -> bool:
+        with self._conn() as c:
+            return c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,)).fetchone() is not None
+
+    def get_allowed_users(self) -> list[int]:
+        with self._conn() as c:
+            return [r[0] for r in c.execute("SELECT user_id FROM allowed_users").fetchall()]
