@@ -26,9 +26,8 @@ logger = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────
 BOT_TOKEN = "8791687514:AAHJ1zceedGvmfqY6f9FK_b-S54E5R9nBCM"
-CHAT_ID = "1087422106"  # default notification chat id; can be changed via bot
-ADMIN_ID = 1087422106   # admin user id (can manage whitelist)
-CHECK_INTERVAL = 240   # seconds (5 min)
+ADMIN_ID = 1087422106
+CHECK_INTERVAL = 240   # seconds
 # ────────────────────────────────────────────────────────────────────
 
 db = Database()
@@ -76,9 +75,17 @@ _last_check: float | None = None
 _force_check: asyncio.Event | None = None
 
 
-def _extract_query(url: str) -> str | None:
+def _extract_url_info(url: str) -> tuple[str, str] | None:
+    """Extract (domain, search_text) from a Vinted URL."""
     try:
-        return parse_qs(urlparse(url).query).get("search_text", [None])[0]
+        parsed = urlparse(url)
+        domain = parsed.hostname
+        if not domain or "vinted" not in domain:
+            return None
+        query = parse_qs(parsed.query).get("search_text", [None])[0]
+        if not query:
+            return None
+        return (domain, query)
     except Exception:
         return None
 
@@ -87,7 +94,6 @@ TG_MSG_LIMIT = 4096
 
 
 def _split_message(header: str, blocks: list[str], sep: str = "\n\n") -> list[str]:
-    """Split blocks into multiple messages respecting Telegram's 4096 char limit."""
     chunks = []
     current = header
     for block in blocks:
@@ -102,6 +108,14 @@ def _split_message(header: str, blocks: list[str], sep: str = "\n\n") -> list[st
     return chunks
 
 
+def _domain_flag(domain: str) -> str:
+    if "vinted.pl" in domain:
+        return "\U0001f1f5\U0001f1f1"
+    elif "vinted.fr" in domain:
+        return "\U0001f1eb\U0001f1f7"
+    return "\U0001f310"
+
+
 # ── Handlers ────────────────────────────────────────────────────────
 
 @router.message(CommandStart())
@@ -114,9 +128,9 @@ async def cmd_start(message: Message, state: FSMContext):
             "Напишите администратору: @wazzamp"
         )
         return
-    cid = str(message.chat.id)
-    if not db.get_chat_id():
-        db.set_chat_id(CHAT_ID or cid)
+    # set default chat_id to the current chat if not set
+    if not db.get_chat_id(uid):
+        db.set_chat_id(uid, str(message.chat.id))
     await message.answer("Vinted Monitor Bot", reply_markup=_get_kb(uid))
 
 
@@ -141,7 +155,8 @@ async def btn_add(message: Message, state: FSMContext):
         return
     await state.set_state(Form.waiting_url)
     await message.answer(
-        "Отправьте ссылку на поиск Vinted:",
+        "Отправьте ссылку на поиск Vinted\n"
+        "(например https://www.vinted.pl/catalog?search_text=...):",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="Отмена")]],
             resize_keyboard=True,
@@ -157,9 +172,10 @@ async def cancel_add(message: Message, state: FSMContext):
 
 @router.message(Form.waiting_url)
 async def recv_url(message: Message, state: FSMContext):
-    kb = _get_kb(message.from_user.id)
-    query = _extract_query(message.text.strip())
-    if not query:
+    uid = message.from_user.id
+    kb = _get_kb(uid)
+    info = _extract_url_info(message.text.strip())
+    if not info:
         await state.clear()
         await message.answer(
             "Не удалось извлечь запрос. Нужна ссылка вида:\n"
@@ -168,13 +184,18 @@ async def recv_url(message: Message, state: FSMContext):
         )
         return
 
-    if not db.add_watch(query):
+    domain, query = info
+
+    if not db.add_watch(uid, domain, query):
         await state.clear()
-        await message.answer(f'"{query}" уже отслеживается.', reply_markup=kb)
+        await message.answer(
+            f'{_domain_flag(domain)} "{query}" на {domain} уже отслеживается.',
+            reply_markup=kb,
+        )
         return
 
-    await message.answer(f'Добавлено: "{query}"\nПервичный парсинг...')
-    count = await asyncio.to_thread(_initial_parse, query)
+    await message.answer(f'{_domain_flag(domain)} Добавлено: "{query}" на {domain}\nПервичный парсинг...')
+    count = await asyncio.to_thread(_initial_parse, domain, query)
     await state.clear()
     await message.answer(
         f"Сохранено {count} товаров. Новые будут приходить в уведомлениях.",
@@ -182,14 +203,9 @@ async def recv_url(message: Message, state: FSMContext):
     )
 
 
-def _initial_parse(query: str) -> int:
-    results = vinted.search_all(query)
-    ids = []
-    for items in results.values():
-        for item in items:
-            iid = item.get("id")
-            if iid:
-                ids.append(iid)
+def _initial_parse(domain: str, query: str) -> int:
+    items = vinted.search(domain, query)
+    ids = [item.get("id") for item in items if item.get("id")]
     if ids:
         db.mark_seen(ids)
     return len(ids)
@@ -202,14 +218,18 @@ async def btn_remove(message: Message, state: FSMContext):
     if not await _check_access(message):
         return
     await state.clear()
-    watches = db.get_watches()
+    uid = message.from_user.id
+    watches = db.get_watches(uid)
     if not watches:
-        await message.answer("Нет отслеживаемых запросов.", reply_markup=_get_kb(message.from_user.id))
+        await message.answer("Нет отслеживаемых запросов.", reply_markup=_get_kb(uid))
         return
 
     keyboard = [
-        [InlineKeyboardButton(text=q, callback_data=f"rm:{q[:60]}")]
-        for q in watches
+        [InlineKeyboardButton(
+            text=f"{_domain_flag(domain)} {query} ({domain})",
+            callback_data=f"rm:{wid}",
+        )]
+        for wid, domain, query in watches
     ]
     await message.answer(
         "Выберите для удаления:",
@@ -219,10 +239,10 @@ async def btn_remove(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("rm:"))
 async def cb_remove(callback: CallbackQuery):
-    prefix = callback.data[3:]
-    full = next((w for w in db.get_watches() if w.startswith(prefix)), prefix)
-    if db.remove_watch(full):
-        await callback.message.edit_text(f'Удалено: "{full}"')
+    uid = callback.from_user.id
+    wid = int(callback.data[3:])
+    if db.remove_watch_by_id(uid, wid):
+        await callback.message.edit_text("Удалено.")
     else:
         await callback.message.edit_text("Не найдено.")
     await callback.answer()
@@ -235,18 +255,18 @@ async def btn_list(message: Message, state: FSMContext):
     if not await _check_access(message):
         return
     await state.clear()
-    kb = _get_kb(message.from_user.id)
-    watches = db.get_watches()
+    uid = message.from_user.id
+    kb = _get_kb(uid)
+    watches = db.get_watches(uid)
     if not watches:
         await message.answer("Нет отслеживаемых запросов.", reply_markup=kb)
         return
 
     lines = []
-    for i, q in enumerate(watches, 1):
-        encoded = q.replace(" ", "+")
-        pl = f"https://www.vinted.pl/catalog?search_text={encoded}"
-        fr = f"https://www.vinted.fr/catalog?search_text={encoded}"
-        lines.append(f"{i}. {q}\n   PL: {pl}\n   FR: {fr}")
+    for i, (wid, domain, query) in enumerate(watches, 1):
+        encoded = query.replace(" ", "+")
+        url = f"https://{domain}/catalog?search_text={encoded}"
+        lines.append(f"{i}. {_domain_flag(domain)} {query}\n   {url}")
 
     header = "Отслеживаемые запросы:\n\n"
     chunks = _split_message(header, lines, sep="\n\n")
@@ -279,13 +299,14 @@ async def cancel_chat_id(message: Message, state: FSMContext):
 @router.message(Form.waiting_chat_id)
 async def recv_chat_id(message: Message, state: FSMContext):
     import re
+    uid = message.from_user.id
     cid = message.text.strip()
     if not re.fullmatch(r"-?\d+", cid):
         await message.answer("Chat ID должен содержать только цифры и '-'. Попробуйте снова:")
         return
-    db.set_chat_id(cid)
+    db.set_chat_id(uid, cid)
     await state.clear()
-    await message.answer(f"Chat ID: {cid}", reply_markup=_get_kb(message.from_user.id))
+    await message.answer(f"Chat ID: {cid}", reply_markup=_get_kb(uid))
 
 
 @router.message(F.text == "Показать Chat ID")
@@ -293,8 +314,9 @@ async def btn_show_cid(message: Message, state: FSMContext):
     if not await _check_access(message):
         return
     await state.clear()
-    cid = db.get_chat_id()
-    await message.answer(f"Chat ID: {cid or 'не задан'}", reply_markup=_get_kb(message.from_user.id))
+    uid = message.from_user.id
+    cid = db.get_chat_id(uid)
+    await message.answer(f"Chat ID: {cid or 'не задан'}", reply_markup=_get_kb(uid))
 
 
 @router.message(F.text == "Статус")
@@ -302,6 +324,7 @@ async def btn_status(message: Message, state: FSMContext):
     if not await _check_access(message):
         return
     await state.clear()
+    uid = message.from_user.id
     global _last_check
     if _last_check is None:
         remaining = CHECK_INTERVAL
@@ -309,11 +332,11 @@ async def btn_status(message: Message, state: FSMContext):
         elapsed = time.time() - _last_check
         remaining = max(0, CHECK_INTERVAL - elapsed)
     mins, secs = divmod(int(remaining), 60)
-    watches = len(db.get_watches())
+    watches = len(db.get_watches(uid))
     await message.answer(
-        f"Отслеживается запросов: {watches}\n"
+        f"Ваших запросов: {watches}\n"
         f"Следующая проверка через: {mins}м {secs}с",
-        reply_markup=_get_kb(message.from_user.id),
+        reply_markup=_get_kb(uid),
     )
     await message.answer(
         "Запустить проверку вручную?",
@@ -423,26 +446,32 @@ async def btn_list_users(message: Message, state: FSMContext):
 # ── Monitoring ──────────────────────────────────────────────────────
 
 async def run_check():
-    """Run a single check cycle. Returns total new items found."""
-    chat_id = db.get_chat_id()
-    if not chat_id:
+    """Run a single check cycle for all users."""
+    all_watches = db.get_all_watches()
+    if not all_watches:
         return 0
 
-    watches = db.get_watches()
-    if not watches:
-        return 0
+    # Group watches by user_id
+    user_watches: dict[int, list[tuple[str, str]]] = {}
+    for _wid, user_id, domain, search_text in all_watches:
+        user_watches.setdefault(user_id, []).append((domain, search_text))
 
     total_new = 0
-    for query in watches:
-        try:
-            results = await asyncio.to_thread(vinted.search_all, query, 2)
-        except Exception:
-            logger.exception(f"Monitor error for '{query}'")
-            continue
+    for user_id, watches in user_watches.items():
+        chat_id = db.get_chat_id(user_id)
+        if not chat_id:
+            chat_id = str(user_id)
 
-        new_ids = []
-        for domain, items in results.items():
-            flag = "\U0001f1f5\U0001f1f1" if "vinted.pl" in domain else "\U0001f1eb\U0001f1f7"
+        user_new = 0
+        for domain, query in watches:
+            try:
+                items = await asyncio.to_thread(vinted.search, domain, query, max_pages=2)
+            except Exception:
+                logger.exception(f"Monitor error for '{query}' on {domain}")
+                continue
+
+            flag = _domain_flag(domain)
+            new_ids = []
             for item in items:
                 iid = item.get("id")
                 if not iid or db.is_seen(iid):
@@ -478,18 +507,20 @@ async def run_check():
                 except Exception:
                     logger.exception("Send failed")
 
-        if new_ids:
-            db.mark_seen(new_ids)
-        total_new += len(new_ids)
+            if new_ids:
+                db.mark_seen(new_ids)
+            user_new += len(new_ids)
 
-    if total_new == 0:
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="Проверка завершена — новых товаров не найдено.",
-            )
-        except Exception:
-            logger.exception("Status send failed")
+        if user_new == 0:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Проверка завершена — новых товаров не найдено.",
+                )
+            except Exception:
+                logger.exception("Status send failed")
+
+        total_new += user_new
 
     return total_new
 
