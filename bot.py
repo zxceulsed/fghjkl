@@ -25,8 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────
-BOT_TOKEN = "8791687514:AAHJ1zceedGvmfqY6f9FK_b-S54E5R9nBCM"
-ADMIN_ID = 1087422106
+BOT_TOKEN = "6374810081:AAG2YazUJqWkPJp8vZw4cwfirodwAj2W6WY"
+ADMIN_ID = 823388511
 CHECK_INTERVAL = 240   # seconds
 # ────────────────────────────────────────────────────────────────────
 
@@ -510,15 +510,6 @@ async def run_check():
             if new_ids:
                 db.mark_seen(new_ids)
             user_new += len(new_ids)
-
-        if user_new == 0:
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="Проверка завершена — новых товаров не найдено.",
-                )
-            except Exception:
-                logger.exception("Status send failed")
 
         total_new += user_new
 
