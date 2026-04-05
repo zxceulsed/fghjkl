@@ -15,7 +15,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from vinted import VintedClient
+from vinted import VintedClient, DOMAIN_LANG
 from db import Database
 
 logging.basicConfig(
@@ -25,8 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────
-BOT_TOKEN = "6374810081:AAG2YazUJqWkPJp8vZw4cwfirodwAj2W6WY"
-ADMIN_ID = 823388511
+BOT_TOKEN = "8791687514:AAHJ1zceedGvmfqY6f9FK_b-S54E5R9nBCM"
+ADMIN_ID = 1087422106
 CHECK_INTERVAL = 240   # seconds
 # ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +38,7 @@ router = Router()
 
 class Form(StatesGroup):
     waiting_url = State()
+    choosing_category = State()
     waiting_chat_id = State()
     waiting_add_user = State()
     waiting_remove_user = State()
@@ -186,25 +187,226 @@ async def recv_url(message: Message, state: FSMContext):
 
     domain, query = info
 
-    if not db.add_watch(uid, domain, query):
+    await message.answer(
+        f"{_domain_flag(domain)} Загружаю категории для {domain}...",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+        ),
+    )
+
+    catalogs = await asyncio.to_thread(vinted.get_catalogs, domain)
+    if not catalogs:
+        # No catalogs available — add without categories
+        watch_id = db.add_watch(uid, domain, query)
+        if watch_id is None:
+            await state.clear()
+            await message.answer(
+                f'{_domain_flag(domain)} "{query}" на {domain} уже отслеживается.',
+                reply_markup=kb,
+            )
+            return
+        await message.answer(f'{_domain_flag(domain)} Добавлено: "{query}" на {domain}\nПервичный парсинг...')
+        count = await asyncio.to_thread(_initial_parse, domain, query, None)
         await state.clear()
         await message.answer(
-            f'{_domain_flag(domain)} "{query}" на {domain} уже отслеживается.',
+            f"Сохранено {count} товаров. Новые будут приходить в уведомлениях.",
             reply_markup=kb,
         )
         return
 
-    await message.answer(f'{_domain_flag(domain)} Добавлено: "{query}" на {domain}\nПервичный парсинг...')
-    count = await asyncio.to_thread(_initial_parse, domain, query)
-    await state.clear()
+    await state.set_state(Form.choosing_category)
+    await state.update_data(domain=domain, query=query, selected_ids=[], catalog_path=[])
+
+    translations = await asyncio.to_thread(
+        vinted.translate_titles,
+        [c["title"] for c in catalogs],
+        DOMAIN_LANG.get(domain, "fr"),
+    )
+    keyboard = _build_catalog_keyboard(catalogs, [], translations=translations)
     await message.answer(
-        f"Сохранено {count} товаров. Новые будут приходить в уведомлениях.",
-        reply_markup=kb,
+        f'Запрос: "{query}" на {domain}\n\n'
+        "Выберите категории (можно несколько) или нажмите «Без категории»:",
+        reply_markup=keyboard,
     )
 
 
-def _initial_parse(domain: str, query: str) -> int:
-    items = vinted.search(domain, query)
+def _build_catalog_keyboard(
+    catalogs: list[dict], selected_ids: list[int], parent_id: int | None = None,
+    translations: dict[str, str] | None = None,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for catalog selection."""
+    buttons = []
+    for cat in catalogs:
+        cid = cat["id"]
+        original_title = cat["title"]
+        title = (translations or {}).get(original_title, original_title)
+        has_children = bool(cat.get("catalogs"))
+        check = "✅ " if cid in selected_ids else ""
+        suffix = " ›" if has_children else ""
+        buttons.append([InlineKeyboardButton(
+            text=f"{check}{title}{suffix}",
+            callback_data=f"cat:{cid}",
+        )])
+
+    footer = []
+    if parent_id is not None:
+        footer.append(InlineKeyboardButton(text="‹ Назад", callback_data="cat:back"))
+    footer.append(InlineKeyboardButton(text="Без категории", callback_data="cat:skip"))
+    if selected_ids:
+        footer.append(InlineKeyboardButton(
+            text=f"Готово ({len(selected_ids)})", callback_data="cat:done",
+        ))
+    buttons.append(footer)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _find_catalog(catalogs: list[dict], target_id: int) -> dict | None:
+    """Find a catalog node by id in the tree."""
+    for cat in catalogs:
+        if cat["id"] == target_id:
+            return cat
+        found = _find_catalog(cat.get("catalogs", []), target_id)
+        if found:
+            return found
+    return None
+
+
+def _get_catalogs_at_path(catalogs: list[dict], path: list[int]) -> tuple[list[dict], int | None]:
+    """Navigate the catalog tree following path, return (items, parent_id)."""
+    current = catalogs
+    parent_id = None
+    for pid in path:
+        node = _find_catalog(current, pid)
+        if node and node.get("catalogs"):
+            parent_id = pid
+            current = node["catalogs"]
+        else:
+            break
+    return current, parent_id
+
+
+async def _translate_level(catalogs: list[dict], domain: str) -> dict[str, str]:
+    """Translate titles of the given catalog level to Russian."""
+    titles = [c["title"] for c in catalogs]
+    lang = DOMAIN_LANG.get(domain, "fr")
+    return await asyncio.to_thread(vinted.translate_titles, titles, lang)
+
+
+@router.callback_query(F.data.startswith("cat:"))
+async def cb_catalog(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != Form.choosing_category.state:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    domain = data["domain"]
+    query = data["query"]
+    selected_ids: list[int] = data.get("selected_ids", [])
+    catalog_path: list[int] = data.get("catalog_path", [])
+    uid = callback.from_user.id
+    kb = _get_kb(uid)
+
+    action = callback.data[4:]
+
+    if action == "skip":
+        # Add without categories
+        watch_id = db.add_watch(uid, domain, query)
+        if watch_id is None:
+            await state.clear()
+            await callback.message.edit_text(
+                f'{_domain_flag(domain)} "{query}" на {domain} уже отслеживается.',
+            )
+            await callback.message.answer("Меню:", reply_markup=kb)
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            f'{_domain_flag(domain)} Добавлено: "{query}" на {domain}\nПервичный парсинг...',
+        )
+        count = await asyncio.to_thread(_initial_parse, domain, query, None)
+        await state.clear()
+        await callback.message.answer(
+            f"Сохранено {count} товаров. Новые будут приходить в уведомлениях.",
+            reply_markup=kb,
+        )
+        await callback.answer()
+        return
+
+    if action == "done":
+        watch_id = db.add_watch(uid, domain, query, selected_ids)
+        if watch_id is None:
+            await state.clear()
+            await callback.message.edit_text(
+                f'{_domain_flag(domain)} "{query}" на {domain} с такими категориями уже отслеживается.',
+            )
+            await callback.message.answer("Меню:", reply_markup=kb)
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            f'{_domain_flag(domain)} Добавлено: "{query}" на {domain}\n'
+            f"Категории: {len(selected_ids)} шт.\nПервичный парсинг...",
+        )
+        count = await asyncio.to_thread(_initial_parse, domain, query, selected_ids)
+        await state.clear()
+        await callback.message.answer(
+            f"Сохранено {count} товаров. Новые будут приходить в уведомлениях.",
+            reply_markup=kb,
+        )
+        await callback.answer()
+        return
+
+    if action == "back":
+        if catalog_path:
+            catalog_path.pop()
+            await state.update_data(catalog_path=catalog_path)
+        catalogs = await asyncio.to_thread(vinted.get_catalogs, domain)
+        current_items, parent_id = _get_catalogs_at_path(catalogs, catalog_path)
+        translations = await _translate_level(current_items, domain)
+        keyboard = _build_catalog_keyboard(current_items, selected_ids, parent_id, translations)
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+        await callback.answer()
+        return
+
+    # Clicked on a category
+    cid = int(action)
+    catalogs = await asyncio.to_thread(vinted.get_catalogs, domain)
+    node = _find_catalog(catalogs, cid)
+    if not node:
+        await callback.answer("Категория не найдена")
+        return
+
+    if node.get("catalogs"):
+        # Has subcategories — navigate into it
+        catalog_path.append(cid)
+        await state.update_data(catalog_path=catalog_path)
+        current_items, parent_id = _get_catalogs_at_path(catalogs, catalog_path)
+        translations = await _translate_level(current_items, domain)
+        keyboard = _build_catalog_keyboard(current_items, selected_ids, parent_id, translations)
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+        await callback.answer()
+    else:
+        # Leaf category ��� toggle selection
+        if cid in selected_ids:
+            selected_ids.remove(cid)
+        else:
+            selected_ids.append(cid)
+        await state.update_data(selected_ids=selected_ids)
+        current_items, parent_id = _get_catalogs_at_path(catalogs, catalog_path)
+        translations = await _translate_level(current_items, domain)
+        keyboard = _build_catalog_keyboard(current_items, selected_ids, parent_id, translations)
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+        await callback.answer()
+
+
+@router.message(Form.choosing_category, F.text == "Отмена")
+async def cancel_category(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=_get_kb(message.from_user.id))
+
+
+def _initial_parse(domain: str, query: str, catalog_ids: list[int] | None) -> int:
+    items = vinted.search(domain, query, catalog_ids=catalog_ids)
     ids = [item.get("id") for item in items if item.get("id")]
     if ids:
         db.mark_seen(ids)
@@ -224,13 +426,13 @@ async def btn_remove(message: Message, state: FSMContext):
         await message.answer("Нет отслеживаемых запросов.", reply_markup=_get_kb(uid))
         return
 
-    keyboard = [
-        [InlineKeyboardButton(
-            text=f"{_domain_flag(domain)} {query} ({domain})",
+    keyboard = []
+    for wid, domain, query, cat_ids in watches:
+        cat_label = f" [{len(cat_ids)} кат.]" if cat_ids else ""
+        keyboard.append([InlineKeyboardButton(
+            text=f"{_domain_flag(domain)} {query}{cat_label} ({domain})",
             callback_data=f"rm:{wid}",
-        )]
-        for wid, domain, query in watches
-    ]
+        )])
     await message.answer(
         "Выберите для удаления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
@@ -263,10 +465,11 @@ async def btn_list(message: Message, state: FSMContext):
         return
 
     lines = []
-    for i, (wid, domain, query) in enumerate(watches, 1):
+    for i, (wid, domain, query, cat_ids) in enumerate(watches, 1):
         encoded = query.replace(" ", "+")
         url = f"https://{domain}/catalog?search_text={encoded}"
-        lines.append(f"{i}. {_domain_flag(domain)} {query}\n   {url}")
+        cat_label = f"\n   Категории: {len(cat_ids)} шт." if cat_ids else ""
+        lines.append(f"{i}. {_domain_flag(domain)} {query}\n   {url}{cat_label}")
 
     header = "Отслеживаемые запросы:\n\n"
     chunks = _split_message(header, lines, sep="\n\n")
@@ -452,9 +655,9 @@ async def run_check():
         return 0
 
     # Group watches by user_id
-    user_watches: dict[int, list[tuple[str, str]]] = {}
-    for _wid, user_id, domain, search_text in all_watches:
-        user_watches.setdefault(user_id, []).append((domain, search_text))
+    user_watches: dict[int, list[tuple[str, str, list[int]]]] = {}
+    for _wid, user_id, domain, search_text, cat_ids in all_watches:
+        user_watches.setdefault(user_id, []).append((domain, search_text, cat_ids))
 
     total_new = 0
     for user_id, watches in user_watches.items():
@@ -463,9 +666,12 @@ async def run_check():
             chat_id = str(user_id)
 
         user_new = 0
-        for domain, query in watches:
+        for domain, query, cat_ids in watches:
             try:
-                items = await asyncio.to_thread(vinted.search, domain, query, max_pages=2)
+                items = await asyncio.to_thread(
+                    vinted.search, domain, query, max_pages=2,
+                    catalog_ids=cat_ids or None,
+                )
             except Exception:
                 logger.exception(f"Monitor error for '{query}' on {domain}")
                 continue

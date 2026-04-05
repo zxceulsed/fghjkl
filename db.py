@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 
@@ -19,7 +20,8 @@ class Database:
                     user_id INTEGER NOT NULL,
                     domain TEXT NOT NULL,
                     search_text TEXT NOT NULL,
-                    UNIQUE(user_id, domain, search_text)
+                    catalog_ids TEXT NOT NULL DEFAULT '',
+                    UNIQUE(user_id, domain, search_text, catalog_ids)
                 );
                 CREATE TABLE IF NOT EXISTS seen (
                     item_id INTEGER PRIMARY KEY
@@ -32,19 +34,47 @@ class Database:
                     user_id INTEGER PRIMARY KEY
                 );
             """)
+            # migrate: add catalog_ids column if missing
+            cols = [r[1] for r in c.execute("PRAGMA table_info(user_watches)").fetchall()]
+            if "catalog_ids" not in cols:
+                c.execute("ALTER TABLE user_watches ADD COLUMN catalog_ids TEXT NOT NULL DEFAULT ''")
 
     # --- per-user watches ---
 
-    def add_watch(self, user_id: int, domain: str, search_text: str) -> bool:
+    @staticmethod
+    def _encode_catalog_ids(catalog_ids: list[int] | None) -> str:
+        if not catalog_ids:
+            return ""
+        return json.dumps(sorted(catalog_ids))
+
+    @staticmethod
+    def _decode_catalog_ids(raw: str) -> list[int]:
+        if not raw:
+            return []
+        return json.loads(raw)
+
+    def add_watch(self, user_id: int, domain: str, search_text: str,
+                  catalog_ids: list[int] | None = None) -> int | None:
+        """Add a watch. Returns the new watch id, or None if duplicate."""
+        encoded = self._encode_catalog_ids(catalog_ids)
         try:
             with self._conn() as c:
-                c.execute(
-                    "INSERT INTO user_watches (user_id, domain, search_text) VALUES (?, ?, ?)",
-                    (user_id, domain, search_text),
+                cur = c.execute(
+                    "INSERT INTO user_watches (user_id, domain, search_text, catalog_ids) "
+                    "VALUES (?, ?, ?, ?)",
+                    (user_id, domain, search_text, encoded),
                 )
-            return True
+            return cur.lastrowid
         except sqlite3.IntegrityError:
-            return False
+            return None
+
+    def update_watch_catalogs(self, watch_id: int, catalog_ids: list[int] | None) -> None:
+        encoded = self._encode_catalog_ids(catalog_ids)
+        with self._conn() as c:
+            c.execute(
+                "UPDATE user_watches SET catalog_ids = ? WHERE id = ?",
+                (encoded, watch_id),
+            )
 
     def remove_watch_by_id(self, user_id: int, watch_id: int) -> bool:
         with self._conn() as c:
@@ -53,20 +83,22 @@ class Database:
                 (watch_id, user_id),
             ).rowcount > 0
 
-    def get_watches(self, user_id: int) -> list[tuple[int, str, str]]:
-        """Returns list of (id, domain, search_text) for user."""
+    def get_watches(self, user_id: int) -> list[tuple[int, str, str, list[int]]]:
+        """Returns list of (id, domain, search_text, catalog_ids) for user."""
         with self._conn() as c:
-            return c.execute(
-                "SELECT id, domain, search_text FROM user_watches WHERE user_id = ?",
+            rows = c.execute(
+                "SELECT id, domain, search_text, catalog_ids FROM user_watches WHERE user_id = ?",
                 (user_id,),
             ).fetchall()
+        return [(wid, d, q, self._decode_catalog_ids(c)) for wid, d, q, c in rows]
 
-    def get_all_watches(self) -> list[tuple[int, int, str, str]]:
-        """Returns all watches: (id, user_id, domain, search_text)."""
+    def get_all_watches(self) -> list[tuple[int, int, str, str, list[int]]]:
+        """Returns all watches: (id, user_id, domain, search_text, catalog_ids)."""
         with self._conn() as c:
-            return c.execute(
-                "SELECT id, user_id, domain, search_text FROM user_watches"
+            rows = c.execute(
+                "SELECT id, user_id, domain, search_text, catalog_ids FROM user_watches"
             ).fetchall()
+        return [(wid, uid, d, q, self._decode_catalog_ids(c)) for wid, uid, d, q, c in rows]
 
     # --- seen items ---
 
